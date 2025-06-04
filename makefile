@@ -1,11 +1,12 @@
 LDLIBS=-lpcap
 
-all: send-arp-test
+all: tcp-block
 
+main.o: mac.h ip.h ethhdr.h iphdr.h tcphdr.h main.cpp
 
-main.o: mac.h ip.h ethhdr.h arphdr.h main.cpp
+tcphdr.o: tcphdr.h tcphdr.cpp
 
-arphdr.o: mac.h ip.h arphdr.h arphdr.cpp
+iphdr.o: ip.h iphdr.h iphdr.cpp
 
 ethhdr.o: mac.h ethhdr.h ethhdr.cpp
 
@@ -13,8 +14,8 @@ ip.o: ip.h ip.cpp
 
 mac.o : mac.h mac.cpp
 
-send-arp-test: main.o arphdr.o ethhdr.o ip.o mac.o
+tcp-block: main.o tcphdr.o iphdr.o ethhdr.o ip.o mac.o
 	$(LINK.cc) $^ $(LOADLIBES) $(LDLIBS) -o $@
 
 clean:
-	rm -f send-arp-test *.o
+	rm -f tcp-block *.o
