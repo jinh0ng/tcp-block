@@ -89,7 +89,7 @@ void dumpPacket(const u_char *packet)
 				std::string(static_cast<std::string>(iphdr->dip())).c_str(),
 				iphdr->ttl(), iphdr->len());
 
-	// TCP 헤더 및 페이로드
+	// TCP 헤더 & 페이로드
 	int ip_hdr_len = iphdr->hl() * 4;
 	const u_char *ptr_tcp = ptr_ip + ip_hdr_len;
 	const TcpHdr *tcphdr = reinterpret_cast<const TcpHdr *>(ptr_tcp);
@@ -148,6 +148,155 @@ bool getMyInfo(const char *iface, MyInfo &myinfo)
 
 	close(sock_fd);
 	return true;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 정방향 RST 패킷 생성/전송
+//   - handle: pcap 핸들러
+//   - client_mac, server_mac: 이더넷 헤더용 MAC
+//   - client_ip, server_ip: IP 헤더용 주소
+//   - client_port, server_port: TCP 헤더용 포트
+//   - seq, payload_len: 원본 패킷의 seq, payload 길이
+// ──────────────────────────────────────────────────────────────────────────────
+void sendRstPacket(pcap_t *handle,
+				   const Mac &client_mac, const Mac &server_mac,
+				   const Ip &client_ip, const Ip &server_ip,
+				   uint16_t client_port, uint16_t server_port,
+				   uint32_t seq, int payload_len)
+{
+
+	// (1) Ethernet 헤더: [dst=server_mac, src=client_mac, type=0x0800]
+	uint8_t ethbuf[sizeof(EthHdr)];
+	EthHdr *eth = reinterpret_cast<EthHdr *>(ethbuf);
+	eth->dmac_ = server_mac;
+	eth->smac_ = client_mac;
+	eth->type_ = htons(EthHdr::Ip4);
+
+	// (2) IP 헤더: version=4, ihl=5(20B), total=20+20, TTL=64, proto=TCP
+	IpHdr ip_new;
+	ip_new.v_hl_ = (4 << 4) | 5;
+	ip_new.tos_ = 0;
+	uint16_t ip_total_len = sizeof(IpHdr) + sizeof(TcpHdr);
+	ip_new.len_ = htons(ip_total_len);
+	ip_new.id_ = htons(0);
+	ip_new.off_ = htons(0);
+	ip_new.ttl_ = 64;
+	ip_new.p_ = IpHdr::Tcp;
+	ip_new.sum_ = 0;
+	ip_new.sip_ = htonl(static_cast<uint32_t>(client_ip));
+	ip_new.dip_ = htonl(static_cast<uint32_t>(server_ip));
+	// IP 체크섬 계산
+	uint16_t ip_chksum = IpHdr::calcChecksum(&ip_new);
+	ip_new.sum_ = htons(ip_chksum);
+
+	// (3) TCP 헤더: src_port=client_port, dst_port=server_port
+	//     seq = seq + payload_len, ack=0, flags=RST, window=0
+	TcpHdr tcp_new;
+	tcp_new.sport_ = htons(client_port);
+	tcp_new.dport_ = htons(server_port);
+	tcp_new.seq_ = htonl(seq + payload_len);
+	tcp_new.ack_ = htonl(0);
+	tcp_new.off_rsvd_ = (5 << 4); // data offset=5(20B), reserved=0
+	tcp_new.flags_ = TcpHdr::Rst;
+	tcp_new.win_ = htons(0);
+	tcp_new.sum_ = 0;
+	tcp_new.urp_ = htons(0);
+	// TCP 체크섬 계산
+	uint16_t tcp_chksum = TcpHdr::calcChecksum(&ip_new, &tcp_new);
+	tcp_new.sum_ = htons(tcp_chksum);
+
+	// (4) 프레임 버퍼에 [Ethernet|IP|TCP] 순서대로 복사
+	size_t frame_len = sizeof(EthHdr) + sizeof(IpHdr) + sizeof(TcpHdr);
+	u_char *frame = new u_char[frame_len];
+	std::memcpy(frame, eth, sizeof(EthHdr));
+	std::memcpy(frame + sizeof(EthHdr), &ip_new, sizeof(IpHdr));
+	std::memcpy(frame + sizeof(EthHdr) + sizeof(IpHdr), &tcp_new, sizeof(TcpHdr));
+
+	// (5) pcap_sendpacket() 호출
+	if (pcap_sendpacket(handle, frame, frame_len) != 0)
+	{
+		std::fprintf(stderr, "pcap_sendpacket error: %s\n", pcap_geterr(handle));
+	}
+	delete[] frame;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 역방향 FIN+302 Redirect 패킷 생성/전송 (Raw Socket 사용)
+//   - raw_fd: 이미 IP_HDRINCL이 설정된 raw socket
+//   - server_mac, client_mac: (실제 raw socket 송신 시 이더넷 헤더 포함하지 않음)
+//   - server_ip, client_ip: IP 헤더용
+//   - server_port, client_port: TCP 헤더용
+//   - seq, ack: 서버 측 seq, ack 값
+//   - http_body: "HTTP/1.0 302 Redirect\r\nLocation: http://warning.or.kr\r\n\r\n"
+//   - body_len: 해당 문자열 길이
+// ──────────────────────────────────────────────────────────────────────────────
+void sendFinRedirect(int raw_fd,
+					 const Ip &server_ip, const Ip &client_ip,
+					 uint16_t server_port, uint16_t client_port,
+					 uint32_t seq, uint32_t ack,
+					 const char *http_body, size_t body_len)
+{
+
+	// (1) IP 헤더: version=4, ihl=5(20B), total=20+20+body_len, TTL=64, proto=TCP
+	IpHdr ip_new;
+	ip_new.v_hl_ = (4 << 4) | 5;
+	ip_new.tos_ = 0;
+	uint16_t ip_total_len = sizeof(IpHdr) + sizeof(TcpHdr) + body_len;
+	ip_new.len_ = htons(ip_total_len);
+	ip_new.id_ = htons(0);
+	ip_new.off_ = htons(0);
+	ip_new.ttl_ = 64;
+	ip_new.p_ = IpHdr::Tcp;
+	ip_new.sum_ = 0;
+	ip_new.sip_ = htonl(static_cast<uint32_t>(server_ip));
+	ip_new.dip_ = htonl(static_cast<uint32_t>(client_ip));
+	// IP 체크섬 계산
+	uint16_t ip_chksum = IpHdr::calcChecksum(&ip_new);
+	ip_new.sum_ = htons(ip_chksum);
+
+	// (2) TCP 헤더: src_port=server_port, dst_port=client_port
+	//     seq=seq, ack=ack, off=5, flags=FIN|ACK, window=512 (예시)
+	TcpHdr tcp_new;
+	tcp_new.sport_ = htons(server_port);
+	tcp_new.dport_ = htons(client_port);
+	tcp_new.seq_ = htonl(seq);
+	tcp_new.ack_ = htonl(ack);
+	tcp_new.off_rsvd_ = (5 << 4); // data offset=5(20B), reserved=0
+	tcp_new.flags_ = TcpHdr::Fin | TcpHdr::Ack;
+	tcp_new.win_ = htons(512);
+	tcp_new.sum_ = 0;
+	tcp_new.urp_ = htons(0);
+	// TCP 체크섬 계산 (pseudo-header 포함)
+	uint16_t tcp_chksum = TcpHdr::calcChecksum(&ip_new, &tcp_new);
+	tcp_new.sum_ = htons(tcp_chksum);
+
+	// (3) 전체 버퍼: [IP|TCP|Body]
+	size_t packet_len = sizeof(IpHdr) + sizeof(TcpHdr) + body_len;
+	u_char *packet = new u_char[packet_len];
+	std::memcpy(packet, &ip_new, sizeof(IpHdr));
+	std::memcpy(packet + sizeof(IpHdr), &tcp_new, sizeof(TcpHdr));
+	std::memcpy(packet + sizeof(IpHdr) + sizeof(TcpHdr), http_body, body_len);
+
+	// (4) 목적지 주소 구조체 준비
+	struct sockaddr_in dst_addr;
+	std::memset(&dst_addr, 0, sizeof(dst_addr));
+	dst_addr.sin_family = AF_INET;
+	dst_addr.sin_addr.s_addr = htonl(static_cast<uint32_t>(client_ip));
+	dst_addr.sin_port = htons(client_port); // 이미 network-order긴 하지만, sendto에서 정확히 쓸 수 있도록
+
+	// (5) sendto() 호출
+	ssize_t sent_bytes = sendto(raw_fd,
+								packet,
+								packet_len,
+								0,
+								reinterpret_cast<struct sockaddr *>(&dst_addr),
+								sizeof(dst_addr));
+	if (sent_bytes < 0)
+	{
+		perror("sendto");
+	}
+
+	delete[] packet;
 }
 
 int main(int argc, char *argv[])
@@ -277,9 +426,34 @@ int main(int argc, char *argv[])
 		std::printf("[match] Pattern found; dumping headers:\n");
 		dumpPacket(packet);
 
-		// TODO:
+		//
 		//   → 정방향 RST 패킷 생성/전송 코드
+		Mac client_mac = eth->smac(); // 원본 발신지 MAC = 클라이언트 MAC
+		Mac server_mac = eth->dmac(); // 원본 목적지 MAC = 서버 MAC
+		Ip client_ip = iphdr->sip();
+		Ip server_ip = iphdr->dip();
+		uint16_t client_port = tcphdr->sport();
+		uint16_t server_port = tcphdr->dport();
+		uint32_t orig_seq = tcphdr->seq();
+		// payload_len = iphdr->len() - ip_hdr_len - tcp_hdr_len (위에서 계산)
+
+		sendRstPacket(pcap_handle,
+					  client_mac, server_mac,
+					  client_ip, server_ip,
+					  client_port, server_port,
+					  orig_seq, payload_len);
 		//   → 역방향 FIN+Redirect 패킷 생성/전송 코드
+		uint32_t orig_ack = tcphdr->ack();
+		const char *redirect_payload =
+			"HTTP/1.0 302 Redirect\r\n"
+			"Location: http://warning.or.kr\r\n\r\n";
+		size_t redirect_len = std::strlen(redirect_payload);
+
+		sendFinRedirect(raw_sock_fd,
+						server_ip, client_ip,
+						server_port, client_port,
+						orig_ack, orig_seq + payload_len,
+						redirect_payload, redirect_len);
 		//   → 단일 연결에 여러 번 차단하지 않도록 플래그/상태 관리
 
 		// 일단, 캡처 루프를 멈추지 않고 계속 진행
